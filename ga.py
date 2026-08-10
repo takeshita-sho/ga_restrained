@@ -35,7 +35,6 @@ warnings.filterwarnings("ignore", category=RuntimeWarning)
 # Derived (computed from free params, never directly sampled):
 #   krLA   = (20/7) * kfLA
 #   kcatLK = 15 * kfLK - krLK          (penalised to 0 if <= 0)
-#   krLP   = 39 * kfLP - kcatLP        (kfLP lower bound ensures krLP >= 1e-3)
 #   krAP   = 29 * kfAP
 
 KFAK_FIXED    = 0.118
@@ -44,17 +43,14 @@ KCAT_LP_FIXED = 85.3
 
 KDLA = 20.0 / 7.0   # krLA   = KDLA * kfLA
 KDAP = 29.0          # krAP   = KDAP * kfAP
-KMLK  = 15.0          
-KMLP     = 39.0          # krLP   = KMLP     * kfLP - KCAT_LP_FIXED
-
-# Lower bound on kfLP so that krLP = 39*kfLP - 85.3 >= 1e-3
-_KFLP_MIN = (KCAT_LP_FIXED + 1e-3) / KMLP   # ~2.187
+KMLK  = 15.0
 
 parameter_ranges = {
     "kfLA": {"min": 1e-3,      "max": 10.0},   # kf  [1e-3, 10]
     "kfLK": {"min": 1e-3,      "max": 10.0},   # kf  [1e-3, 10]
     "krLK": {"min": 1e-3,      "max": 1e3},    # kr  [1e-3, 1e3]
-    "kfLP": {"min": _KFLP_MIN, "max": 10.0},   # kf  (lower bound ensures krLP >= 1e-3)
+    "kfLP": {"min": 1e-3,      "max": 10.0},   # kf  [1e-3, 10]
+    "krLP": {"min": 1e-3,      "max": 1e3},    # kr  [1e-3, 1e3]
     "kfAP": {"min": 1e-3,      "max": 10.0},   # kf  [1e-3, 10]
     "DF":   {"min": 1e2,      "max": 1e4},
     "L":    {"min": 1e-2,      "max": 1e2},
@@ -63,14 +59,12 @@ parameter_ranges = {
     "A":    {"min": 1e-2,      "max": 1e2},
 }
 
-params_to_optimize = ["kfLA", "kfLK", "krLK", "kfLP", "kfAP", "DF", "L", "K", "P", "A"]
+params_to_optimize = ["kfLA", "kfLK", "krLK", "kfLP", "krLP", "kfAP", "DF", "L", "K", "P", "A"]
 
-
-def _build_ode_params(kfLA, kfLK, krLK, kfLP, kfAP, DF):
+def _build_ode_params(kfLA, kfLK, krLK, kfLP, krLP, kfAP, DF):
     """Assemble the 13-element ODE parameter vector from the free rate/DF params."""
     krLA   = KDLA * kfLA
     kcatLK = KMLK * kfLK - krLK
-    krLP   = KMLP * kfLP - KCAT_LP_FIXED
     krAP   = KDAP * kfAP
     return np.array([kfLA, krLA, kfLK, krLK, kcatLK,
                      kfLP, krLP, KCAT_LP_FIXED,
@@ -86,78 +80,20 @@ def evaluate_candidate(candidate):
     Returns a 1-tuple (fitness,) as required by DEAP FitnessMax.
     Candidates with kcatLK <= 0 are penalised with fitness 0.
     """
-    kfLA, kfLK, krLK, kfLP, kfAP, DF, L, K, P, A = candidate
+    kfLA, kfLK, krLK, kfLP, krLP, kfAP, DF, L, K, P, A = candidate
 
 
     kcatLK = KMLK * kfLK - krLK
-    krLP   = KMLP * kfLP - KCAT_LP_FIXED
-    if kcatLK <= 0 or krLP <= 0:
+    if kcatLK <= 0:
         return (0.0, 0.0, 0.0)
 
-    params = _build_ode_params(kfLA, kfLK, krLK, kfLP, kfAP, DF)
+    params = _build_ode_params(kfLA, kfLK, krLK, kfLP, krLP, kfAP, DF)
     params = np.concat([params, np.array([L, K, P, A], dtype=np.float64)])
     metrics = process_single_row(params, T=2000.0)
 
     return (metrics[0], metrics[1], metrics[2])
 
-    # y0 = np.zeros(16)
-    # y0[0], y0[1], y0[2], y0[3] = L, K, P, A
 
-    # t_span = (0.0, 2000.0)
-    # start_wall = time.time()
-
-    # def timeout_event(t, y, *args):
-    #     if time.time() - start_wall > 300.0:
-    #         raise TimeoutError("ODE solver timed out after 10 minutes")
-    #     return 1.0
-
-    # try:
-    #     sol = solve_ivp(
-    #         fun=full_model_ode,
-    #         t_span=t_span,
-    #         y0=y0,
-    #         args=(params,),
-    #         method='Radau',
-    #         rtol=1e-6,
-    #         atol=1e-8,
-    #         events=[timeout_event],
-    #     )
-
-    #     res = sol.y
-    #     numerator   = res[5] + res[8] + res[9] + res[10] + res[11] + res[14] + res[15]
-    #     denominator = numerator + res[3] + res[12] + res[13]
-
-    #     with np.errstate(divide='ignore', invalid='ignore'):
-    #         Amem = np.where(denominator > 0, numerator / denominator, 0.0)
-
-    #     metrics = calculate_oscillator_metrics(sol.t, Amem)
-    #     fitness = metrics['Fitness']
-    #     period = metrics['Period']
-    #     amplitude = metrics['Amplitude']
-    #     if fitness <= 0.0:
-    #         # Only look at the second half of the time series to ignore initial transients
-    #         halfway_idx = len(sol.t) // 2
-    #         if halfway_idx > 10: # Ensure we have enough data points
-    #             tail_Amem = Amem[halfway_idx:]
-                
-    #             # Calculate standard deviation. A higher std dev means the signal 
-    #             # is fluctuating, which is a stepping stone to oscillation.
-    #             signal_std = np.std(tail_Amem)
-                
-    #             # Give a microscopic fitness score based on standard deviation.
-    #             # It won't beat a true oscillator, but it will beat a flatline.
-    #             if signal_std > 1e-4:
-    #                 # e.g., max partial credit of 0.1, scaling with variance
-    #                 fitness = min(0.1, signal_std * 0.01) 
-                    
-    #                 # We can assign dummy period/amplitude since it's not a true oscillator yet
-    #                 period = 0.0
-    #                 amplitude = signal_std 
-
-    #     return (fitness, period, amplitude)
-
-    # except Exception:
-    #     return (0.0, 0.0, 0.0)
 
 
 # ==================== SOLVER CLASS ====================
@@ -343,11 +279,10 @@ class Solver:
         for rank, idx in enumerate(idx_sorted):
             fitness_val, period_val, amplitude_val = viableFitness[idx]
             opt = viablePoints[idx]
-            kfLA, kfLK, krLK, kfLP, kfAP, DF, L, K, P, A = opt
+            kfLA, kfLK, krLK, kfLP, krLP, kfAP, DF, L, K, P, A = opt
 
             krLA   = KDLA * kfLA
             kcatLK = KMLK * kfLK - krLK
-            krLP   = KMLP * kfLP - KCAT_LP_FIXED
             krAP   = KDAP * kfAP
 
             rows.append({
@@ -360,6 +295,7 @@ class Solver:
                 'kfLK':   kfLK,
                 'krLK':   krLK,
                 'kfLP':   kfLP,
+                'krLP':   krLP,
                 'kfAP':   kfAP,
                 'DF':     DF,
                 'L':      L,
@@ -369,7 +305,6 @@ class Solver:
                 # Derived / fixed (full ODE parameter set)
                 'krLA':   krLA,
                 'kcatLK': kcatLK,
-                'krLP':   krLP,
                 'kcatLP': KCAT_LP_FIXED,
                 'kfAK':   KFAK_FIXED,
                 'krAK':   KRAK_FIXED,
@@ -406,8 +341,8 @@ if __name__ == "__main__":
     _ = full_model_ode(0.0, _dummy_y, _dummy_params)
     print("Pre-compilation complete.")
 
-    POP_SIZE = 1_000_000
-    N_GEN    = 100
+    POP_SIZE = 100
+    N_GEN    = 5
     SAMPLING = "random"   # initial population sampling: "lhs" or "random"
 
     random_id = np.random.randint(1, 10000)
