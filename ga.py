@@ -14,10 +14,12 @@ os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import csv
 import math
 import random
 import numpy as np
 import pandas as pd
+import signal
 import time
 import multiprocessing
 
@@ -48,12 +50,13 @@ KCAT_LP_FIXED = 85.3
 
 KDLA = 20.0 / 7.0   # krLA   = KDLA * kfLA
 KDAP = 29.0          # krAP   = KDAP * kfAP
-KMLK  = 15.0
+#KMLK  = 15.0
 
 parameter_ranges = {
     "kfLA": {"min": 1e-3,      "max": 10.0},   # kf  [1e-3, 10]
     "kfLK": {"min": 1e-3,      "max": 10.0},   # kf  [1e-3, 10]
     "krLK": {"min": 1e-3,      "max": 1e3},    # kr  [1e-3, 1e3]
+    "kcatLK": {"min": 1e-3, "max": 1e3}, 
     "kfLP": {"min": 1e-3,      "max": 10.0},   # kf  [1e-3, 10]
     "krLP": {"min": 1e-3,      "max": 1e3},    # kr  [1e-3, 1e3]
     "kfAP": {"min": 1e-3,      "max": 10.0},   # kf  [1e-3, 10]
@@ -64,23 +67,36 @@ parameter_ranges = {
     "A":    {"min": 1e-2,      "max": 1e2},
 }
 
-params_to_optimize = ["kfLA", "kfLK", "krLK", "kfLP", "krLP", "kfAP", "DF", "L", "K", "P", "A"]
+params_to_optimize = ["kfLA", "kfLK", "krLK", "kcatLK", "kfLP", "krLP", "kfAP", "DF", "L", "K", "P", "A"]
 
 # Only these two genes can violate kcatLK = 15*kfLK - krLK > 0, so only mutations
 # touching them need a constraint re-check.
 IDX_KFLK, IDX_KRLK = params_to_optimize.index("kfLK"), params_to_optimize.index("krLK")
 
-# ODE settings used by the GA. Deliberately shorter than solve_ode.py's defaults: the
-# fitness only needs enough trace to resolve a handful of periods, and the timeout is
-# sized against the ~0.09 s mean solve rather than left at the 600 s bulk-run default.
+# ODE settings the GA passes to solve_ode.process_single_row. The integrator, tolerances
+# and output grid are solve_ode.py's business, not this file's.
+#
+# Job 29959062 measured ~2.3 s/solve against the 0.085 s of job 29790204 -- not a
+# pathology, but the price of the region the GA now finds: with kcatLK free, the recovered
+# solutions have a median period of 66 s, so T=2000 integrates a median of 27 oscillation
+# cycles (and up to ~180). That trajectory length, not any single stiff straggler, is
+# where the time goes.
+#
+# SOLVER_TIMEOUT is wall-clock, since that is what process_single_row's timeout event
+# measures. Keep it generous: the whole point of this run is the long multi-cycle traces,
+# so a tight cap discards exactly the solutions worth having (75.1% of job 29959062's
+# points passed the strict oscillator screen, against 0.1% for the pre-kcatLK baseline).
+# An earlier version of this file cut it to 1 s on the mistaken belief that stragglers
+# dominated; measured cost on real solutions is 3.5-4 s, so that would have thrown away
+# the majority of them.
 SIM_TIME       = 2000.0
 SOLVER_TIMEOUT = 15.0
 
 
-def _build_ode_params(kfLA, kfLK, krLK, kfLP, krLP, kfAP, DF):
+def _build_ode_params(kfLA, kfLK, krLK, kcatLK, kfLP, krLP, kfAP, DF):
     """Assemble the 13-element ODE parameter vector from the free rate/DF params."""
     krLA   = KDLA * kfLA
-    kcatLK = KMLK * kfLK - krLK
+    #kcatLK = KMLK * kfLK - krLK
     krAP   = KDAP * kfAP
     return np.array([kfLA, krLA, kfLK, krLK, kcatLK,
                      kfLP, krLP, KCAT_LP_FIXED,
@@ -88,9 +104,7 @@ def _build_ode_params(kfLA, kfLK, krLK, kfLP, krLP, kfAP, DF):
                      kfAP, krAP, DF], dtype=np.float64)
 
 
-def satisfies_constraints(candidate):
-    """kcatLK = 15*kfLK - krLK must be strictly positive."""
-    return KMLK * candidate[IDX_KFLK] - candidate[IDX_KRLK] > 0
+
 
 
 # ==================== FITNESS FUNCTION ====================
@@ -99,26 +113,36 @@ def evaluate_candidate(candidate):
     """
     Top-level fitness function (module-level for multiprocessing pickling).
 
-    Returns the raw metrics 4-tuple (cost, period, amplitude, is_oscillatory), NOT a
+    Returns (cost, period, amplitude, is_oscillatory, elapsed_seconds, timed_out), NOT a
     DEAP fitness tuple: FitnessMax carries a single weight, so `Solver._evaluate` is
-    responsible for assigning `ind.fitness.values = (cost,)` and stashing the other
-    three on the individual as `ind.metrics`. Consequently this toolbox is NOT drop-in
+    responsible for assigning `ind.fitness.values = (cost,)` and stashing the first four
+    on the individual as `ind.metrics`. Consequently this toolbox is NOT drop-in
     compatible with stock `algorithms.eaSimple` / `eaMuPlusLambda`, which would try to
-    assign all four values and trip DEAP's length assertion.
+    assign all of them and trip DEAP's length assertion.
 
-    Candidates with kcatLK <= 0 are penalised with fitness 0.
+    The last two values are instrumentation, timed around `process_single_row` from the
+    outside so `solve_ode.py` needs no changes. Job 29959062 spent 70 h and 3,239
+    CPU-hours without ever revealing its per-solve cost, which is the whole reason it was
+    hard to diagnose.
+
+    `timed_out` is inferred rather than reported: `process_single_row` folds a timeout and
+    a genuine zero into the same `Fitness = 0`, so the only signal available here is that
+    the call consumed very nearly its whole budget. Wall-clock is the right clock for that
+    comparison because that is what the timeout event inside `process_single_row`
+    measures. The threshold is deliberately loose -- this is a diagnostic counter, not a
+    control input.
     """
-    kfLA, kfLK, krLK, kfLP, krLP, kfAP, DF, L, K, P, A = candidate
+    kfLA, kfLK, krLK, kcatLK, kfLP, krLP, kfAP, DF, L, K, P, A = candidate
 
-    kcatLK = KMLK * kfLK - krLK
-    if kcatLK <= 0:
-        return (0.0, 0.0, 0.0, False)
-
-    params = _build_ode_params(kfLA, kfLK, krLK, kfLP, krLP, kfAP, DF)
+    params = _build_ode_params(kfLA, kfLK, krLK, kcatLK, kfLP, krLP, kfAP, DF)
     params = np.concatenate([params, np.array([L, K, P, A], dtype=np.float64)])
-    metrics = process_single_row(params, T=SIM_TIME, timeout=SOLVER_TIMEOUT)
 
-    return (float(metrics[0]), float(metrics[1]), float(metrics[2]), bool(metrics[3]))
+    t0 = time.perf_counter()
+    metrics = process_single_row(params, T=SIM_TIME, timeout=SOLVER_TIMEOUT, method='LSODA')
+    elapsed = time.perf_counter() - t0
+
+    return (float(metrics[0]), float(metrics[1]), float(metrics[2]), bool(metrics[3]),
+            elapsed, elapsed >= 0.95 * SOLVER_TIMEOUT)
 
 
 # ==================== SOLVER CLASS ====================
@@ -173,37 +197,22 @@ class Solver:
         # (best-in-generation 0.2528 vs best written to CSV 0.1292).
         self.hof = tools.HallOfFame(hofSize)
 
+        # Streaming output. Job 29959062 ran 68 generations and accumulated 1,630,180
+        # viable points, then hit its wall-clock limit and wrote nothing at all -- the
+        # CSVs are only produced after every restart finishes, and SIGTERM does not run
+        # a `finally`. Those points were only recovered by dumping the live process's
+        # memory. Every viable point is now appended as it is found, so a killed run
+        # leaves usable output on disk.
+        self.streamFileName = self.outfileName.replace(".csv", "_stream.csv")
+        self._stream = None
+        self._writer = None
+
         self.pool = multiprocessing.Pool(processes=multiprocessing.cpu_count())
         # Small chunks: solve times vary by orders of magnitude, so the default
         # chunksize (~5200 at a 1M population) load-balances badly.
         self.toolbox.register("map", self.pool.map, chunksize=100)
 
-    def generate_lhs_population(self, n):
-        """
-        Generate the initial population via Latin Hypercube Sampling in log10 space.
 
-        Caveat: the kcatLK constraint rejects ~47% of any hypercube drawn over the full
-        box, and the shortfall is topped up from further batches, so the result is only
-        approximately stratified -- it is not a true Latin hypercube. It is still a
-        better-spread start than independent sampling.
-        """
-        print("Generating initial population via Latin Hypercube Sampling...")
-        dim = len(params_to_optimize)
-        sampler = qmc.LatinHypercube(d=dim, seed=self.seed)
-
-        log_lower = [math.log10(parameter_ranges[p]["min"]) for p in params_to_optimize]
-        log_upper = [math.log10(parameter_ranges[p]["max"]) for p in params_to_optimize]
-
-        valid = []
-        while len(valid) < n:
-            linear = 10.0 ** qmc.scale(sampler.random(n=n), log_lower, log_upper)
-            # Vectorised constraint mask -- the old row-by-row Python loop over 2n
-            # numpy rows was pure overhead.
-            keep = linear[(KMLK * linear[:, IDX_KFLK] - linear[:, IDX_KRLK]) > 0]
-            valid.extend(creator.Candidate(row) for row in keep[: n - len(valid)].tolist())
-
-        print(f"Successfully generated {n} LHS individuals.")
-        return valid
 
     def generate_random_population(self, n):
         """Generates the initial population by independent random log-uniform sampling,
@@ -223,8 +232,8 @@ class Solver:
                 logval = np.random.uniform(math.log10(low), math.log10(high))
                 candidate.append(10.0 ** logval)
 
-            if satisfies_constraints(candidate):
-                return creator.Candidate(candidate)
+            
+            return creator.Candidate(candidate)
 
     def mutateCandidate(self, candidate, indpb, eta, scale):
         """
@@ -271,10 +280,6 @@ class Solver:
             # this should never actually bind.
             candidate[idx] = 10.0 ** min(max(x, xl), xu)
 
-            # Only kfLK/krLK can break the constraint; re-checking the other nine genes
-            # is wasted work.
-            if idx in (IDX_KFLK, IDX_KRLK) and not satisfies_constraints(candidate):
-                candidate[idx] = old_val
 
         return (candidate,)
 
@@ -286,28 +291,108 @@ class Solver:
         # 2. Perform the crossover
         tools.cxTwoPoint(ind1, ind2)
 
-        # 3. Check constraints. If a child is invalid, revert it to its parent's state
-        if not satisfies_constraints(ind1):
-            ind1[:] = parent1_backup
-
-        if not satisfies_constraints(ind2):
-            ind2[:] = parent2_backup
+        
 
         return ind1, ind2
 
+    # ---- streaming output & crash safety ----
+
+    @staticmethod
+    def _fieldnames():
+        """Column order of the streamed CSV, derived from `_build_row` so the two cannot drift."""
+        return list(Solver._build_row([0.0] * len(params_to_optimize), 0.0, 0.0, 0.0, False))
+
+    def _open_stream(self):
+        self._stream = open(self.streamFileName, "w", newline="")
+        self._writer = csv.DictWriter(self._stream, fieldnames=self._fieldnames())
+        self._writer.writeheader()
+        self._stream.flush()
+        print(f"Streaming viable points to {self.streamFileName} as they are found.", flush=True)
+
+    def _close_stream(self):
+        if self._stream is not None:
+            try:
+                self._stream.flush()
+                os.fsync(self._stream.fileno())
+                self._stream.close()
+            except Exception:
+                pass
+            # Drop the writer too: `_record` gates on it, and a live writer over a closed
+            # file would raise rather than skip.
+            self._stream = None
+            self._writer = None
+
+    def install_signal_handlers(self):
+        """
+        Flush results and exit on SIGTERM/SIGUSR1 rather than dying silently.
+
+        Pair with `#SBATCH --signal=B:USR1@600` so SLURM gives 10 minutes' warning before
+        the wall clock, which is what job 29959062 needed and did not have. `os._exit`
+        skips atexit and the pool teardown deliberately -- joining 48 mid-solve workers
+        during a shutdown is exactly the wrong time to block.
+        """
+        def _bail(signum, frame):
+            print(f"\n[signal {signum}] flushing results and exiting.", flush=True)
+            self._close_stream()
+            try:
+                self.write_hallOfFame()
+            except Exception as exc:
+                print(f"  hall-of-fame write failed: {exc!r}", flush=True)
+            sys.stdout.flush()
+            os._exit(0)
+
+        for sig in (signal.SIGTERM, signal.SIGUSR1, signal.SIGINT):
+            signal.signal(sig, _bail)
+
+    # ---- evaluation ----
+
     def _evaluate(self, individuals):
-        """Solve the ODE for `individuals`, cache all four metrics, set scalar fitness."""
+        """
+        Solve the ODE for `individuals`, cache the metrics, set scalar fitness.
+
+        Returns the per-solve (cpu_seconds, timed_out) pairs so the caller can report the
+        cost distribution. Without this the run is a black box: job 29959062 gave no way
+        to tell 2.3 s/solve from 0.085 s/solve until its memory was dumped.
+        """
         if not individuals:
-            return
+            return []
+        timings = []
         for ind, m in zip(individuals, self.toolbox.map(self.toolbox.evaluate, individuals)):
             ind.metrics = (float(m[0]), float(m[1]), float(m[2]), bool(m[3]))
             ind.fitness.values = (ind.metrics[0],)
+            timings.append((m[4], m[5]))
+        return timings
+
+    @staticmethod
+    def _timing_summary(timings):
+        """
+        One-line cost distribution for a generation's solves.
+
+        Times are wall-clock per solve. Because each pool worker is a dedicated process
+        pinned to its own core for the whole solve, summing them is a good estimate of
+        core-hours spent -- compare it against the elapsed generation time times the core
+        count to see how well the pool is load-balancing.
+        """
+        if not timings:
+            return "solves=0"
+        t = np.fromiter((x[0] for x in timings), dtype=np.float64, count=len(timings))
+        total = float(t.sum())
+        n_to = sum(1 for x in timings if x[1])
+        to_time = float(sum(x[0] for x in timings if x[1]))
+        share = (100.0 * to_time / total) if total > 0 else 0.0
+        return (f"s/solve med={np.median(t):.2f} p90={np.percentile(t, 90):.2f} "
+                f"p99={np.percentile(t, 99):.2f} max={t.max():.2f} "
+                f"gen_cost={total / 3600.0:.2f}core-h "
+                f"timeouts={n_to} ({100.0 * n_to / len(t):.2f}%, {share:.0f}% of time)")
 
     def _record(self, individuals, seen, points, fitnesses):
         """
         File every individual clearing the viability gate, returning the count of new
         ones. Membership is tested against a set of parameter tuples rather than the
         old `if ind not in all_viable_points` linear scan, which was O(n^2).
+
+        New points are also appended to the stream file immediately, so the run's output
+        survives a wall-clock kill.
         """
         new = 0
         for ind in individuals:
@@ -319,6 +404,11 @@ class Solver:
                     points.append(list(ind))
                     fitnesses.append([cost, period, amplitude, is_osc])
                     new += 1
+                    if self._writer is not None:
+                        self._writer.writerow(
+                            self._build_row(ind, cost, period, amplitude, is_osc))
+        if new and self._stream is not None:
+            self._stream.flush()
         return new
 
     def _run_one(self, restart_idx, gen_budget, seen, points, fitnesses):
@@ -337,12 +427,13 @@ class Solver:
         # diverse sample of the entire run was never recorded, and (b) ~12.5% of the
         # first selected generation carried an invalid fitness -- which in DEAP only
         # ever wins a tournament when all three aspirants are also invalid.
-        self._evaluate(population)
+        timings = self._evaluate(population)
         self.hof.update(population)
         new = self._record(population, seen, points, fitnesses)
         best = max(ind.metrics[0] for ind in population)
         print(f"  [restart {restart_idx}] gen   0 (initial) : best={best:.6f}  "
-              f"new={new:5d}  total={len(points)}")
+              f"new={new:5d}  total={len(points)}  {self._timing_summary(timings)}",
+              flush=True)
 
         gens_used = 1
         stagnant = 0
@@ -355,7 +446,7 @@ class Solver:
             # a valid fitness and their cached metrics, so re-solving them is pure
             # waste -- roughly 12 h of the 50 h baseline run.
             pending = [ind for ind in offspring if not ind.fitness.valid]
-            self._evaluate(pending)
+            timings = self._evaluate(pending)
 
             self.hof.update(offspring)
             new = self._record(offspring, seen, points, fitnesses)
@@ -364,7 +455,8 @@ class Solver:
             best = max(ind.metrics[0] for ind in offspring)
             print(f"  [restart {restart_idx}] gen {gen:3d}           : best={best:.6f}  "
                   f"new={new:5d}  total={len(points)}  "
-                  f"solved={len(pending)}/{len(offspring)}")
+                  f"solved={len(pending)}/{len(offspring)}  "
+                  f"{self._timing_summary(timings)}", flush=True)
 
             gens_used += 1
             stagnant = 0 if new else stagnant + 1
@@ -392,7 +484,7 @@ class Solver:
     @staticmethod
     def _build_row(opt, fitness_val, period_val, amplitude_val, is_osc):
         """Expand a free-parameter vector into the full ODE parameter set for output."""
-        kfLA, kfLK, krLK, kfLP, krLP, kfAP, DF, L, K, P, A = opt
+        kfLA, kfLK, krLK, kcatLK, kfLP, krLP, kfAP, DF, L, K, P, A = opt
         return {
             'Fitness':        fitness_val,
             'Period':         period_val,
@@ -416,7 +508,7 @@ class Solver:
             'A':      A,
             # Derived / fixed (full ODE parameter set)
             'krLA':   KDLA * kfLA,
-            'kcatLK': KMLK * kfLK - krLK,
+            'kcatLK': kcatLK,
             'kcatLP': KCAT_LP_FIXED,
             'kfAK':   KFAK_FIXED,
             'krAK':   KRAK_FIXED,
@@ -454,16 +546,20 @@ class Solver:
 
     def run(self):
         """Run the full GA pipeline and write results."""
+        self.install_signal_handlers()
+        self._open_stream()
         try:
             viablePoints, viableFitness = self.findNominalValues()
         finally:
-            # Close in a finally so a crash mid-run does not leak the worker pool.
+            # Close in a finally so a crash mid-run does not leak the worker pool, and
+            # so the streamed results are on disk even if the sorted write never happens.
+            self._close_stream()
             self.pool.close()
             self.pool.join()
 
         self.write_sortedParms(viablePoints, viableFitness)
         self.write_hallOfFame()
-        print("GA complete.")
+        print("GA complete.", flush=True)
         return viablePoints, viableFitness
 
 
@@ -484,7 +580,13 @@ if __name__ == "__main__":
     _ = full_model_ode(0.0, _dummy_y, _dummy_params)
     print("Pre-compilation complete.")
 
-    POP_SIZE   = 1_000_000
+    # Sizing. Job 29959062 reached only generation 68 of 100 in its full 3-day allocation
+    # at ~2.3 s/solve. Read the actual cost off the per-generation `s/solve` line in the
+    # log and re-size from it rather than trusting any estimate here:
+    #     generations * population * 0.76 * mean_solve_s / n_cores <= wall_seconds
+    # (the 0.76 is varAnd's clone-skip rate -- 24% of offspring arrive unmodified with a
+    # still-valid fitness and are not re-solved).
+    POP_SIZE   = 100_000
     N_GEN      = 100      # max generations within a single restart
     GEN_BUDGET = 100      # total generations across all restarts (the compute cap)
     RESTARTS   = 4        # max independent restarts within that budget
@@ -502,7 +604,9 @@ if __name__ == "__main__":
     print(f"Output file     : {outfile}")
     print(f"CPU cores       : {multiprocessing.cpu_count()}")
     print(f"Free parameters : {params_to_optimize}")
-    print()
+    print(f"ODE settings    : T={SIM_TIME:g}, timeout={SOLVER_TIMEOUT:g} s "
+          f"(integrator and tolerances are solve_ode.process_single_row's)")
+    print(flush=True)
 
     solver = Solver(populationSize=POP_SIZE, NGEN=N_GEN, outfileName=outfile,
                     sampling=SAMPLING, restarts=RESTARTS, genBudget=GEN_BUDGET,
