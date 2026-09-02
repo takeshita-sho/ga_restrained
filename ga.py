@@ -14,6 +14,7 @@ os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import argparse
 import csv
 import math
 import random
@@ -23,7 +24,6 @@ import signal
 import time
 import multiprocessing
 
-from scipy.stats import qmc
 from deap import base, creator, tools, algorithms
 from oscillator_models.solve_ode import calc_fitness_math, full_model_ode, process_single_row
 
@@ -33,45 +33,134 @@ warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 # ==================== PARAMETER CONSTRAINTS ====================
 #
-# Free parameters (sampled by GA):
-#   kfLA, kfLK, krLK, kfLP, krLP, kfAP, DF, L, K, P, A
+# Two structural constraints can each be enforced or dropped, giving four modes -- see
+# `configure_constraints` and the --free-lk / --free-lp flags:
+#
+#   LK:  kcatLK = KMLK * kfLK - krLK,  with krLK bounded above so kcatLK >= 1e-3
+#   LP:  krLP   = KMLP * kfLP - kcatLP,  with kfLP bounded below so krLP >= 1e-3
+#
+# A dropped constraint turns its derived quantity into an ordinary sampled gene, so the
+# gene vector is 10 parameters with both constraints on and 12 with both off.
+#
+# Free parameters, fully constrained:
+#   kfLA, kfLK, krLK, kfLP, kfAP, DF, L, K, P, A
+#     --free-lk additionally samples kcatLK,  --free-lp additionally samples krLP
 #
 # Fixed:
 #   kfAK = 0.118,  krAK = 0.0609,  kcatLP = 85.3
 #
-# Derived (computed from free params, never directly sampled):
+# Always derived (never sampled in any mode):
 #   krLA   = (20/7) * kfLA
-#   kcatLK = 15 * kfLK - krLK          (penalised to 0 if <= 0)
 #   krAP   = 29 * kfAP
 
 KFAK_FIXED    = 0.118
 KRAK_FIXED    = 0.0609
 KCAT_LP_FIXED = 85.3
 
-KDLA = 20.0 / 7.0   # krLA   = KDLA * kfLA
+KDLA = 20.0 / 7.0    # krLA   = KDLA * kfLA
 KDAP = 29.0          # krAP   = KDAP * kfAP
-#KMLK  = 15.0
+KMLK = 15.0          # kcatLK = KMLK * kfLK - krLK      (LK constraint)
+KMLP = 39.0          # krLP   = KMLP * kfLP - kcatLP    (LP constraint)
 
-parameter_ranges = {
-    "kfLA": {"min": 1e-3,      "max": 10.0},   # kf  [1e-3, 10]
-    "kfLK": {"min": 1e-3,      "max": 10.0},   # kf  [1e-3, 10]
-    "krLK": {"min": 1e-3,      "max": 1e3},    # kr  [1e-3, 1e3]
-    "kcatLK": {"min": 1e-3, "max": 1e3}, 
-    "kfLP": {"min": 1e-3,      "max": 10.0},   # kf  [1e-3, 10]
-    "krLP": {"min": 1e-3,      "max": 1e3},    # kr  [1e-3, 1e3]
-    "kfAP": {"min": 1e-3,      "max": 10.0},   # kf  [1e-3, 10]
-    "DF":   {"min": 1e2,      "max": 1e4},
-    "L":    {"min": 1e-2,      "max": 1e2},
-    "K":    {"min": 1e-3,      "max": 1e2},
-    "P":    {"min": 1e-3,      "max": 1e1},
-    "A":    {"min": 1e-2,      "max": 1e2},
+# Lower bound on kfLP that makes krLP = KMLP*kfLP - KCAT_LP_FIXED >= 1e-3. Under the LP
+# constraint krLP is not a gene at all, so this bound *is* the enforcement -- there is
+# nothing left for a rejection test to catch, which is why satisfies_constraints below
+# only ever looks at LK.
+KFLP_MIN_CONSTRAINED = (KCAT_LP_FIXED + 1e-3) / KMLP   # ~2.187
+
+# Floor on the derived kcatLK. It mirrors the 1e-3 floor the LP constraint places on krLP,
+# and matches the bottom of kcatLK's own sampling range when --free-lk makes it a gene, so
+# kcatLK spans the same interval in every mode. generateCandidate caps krLK with it, which
+# is what makes kcatLK >= KCATLK_MIN true by construction rather than by rejection.
+KCATLK_MIN = 1e-3
+
+# Every range the GA might sample, in the canonical gene order. `configure_constraints`
+# selects the subset that is free in the requested mode; keeping one table here is what
+# stops the constrained and unconstrained variants of a bound from drifting apart.
+PARAM_RANGES_ALL = {
+    "kfLA":   {"min": 1e-3, "max": 10.0},   # kf  [1e-3, 10]
+    "kfLK":   {"min": 1e-3, "max": 10.0},   # kf  [1e-3, 10]
+    "krLK":   {"min": 1e-3, "max": 1e3},    # kr  [1e-3, 1e3]
+    "kcatLK": {"min": 1e-3, "max": 1e3},    # a gene only under --free-lk
+    "kfLP":   {"min": 1e-3, "max": 10.0},   # min raised to KFLP_MIN_CONSTRAINED under LP
+    "krLP":   {"min": 1e-3, "max": 1e3},    # a gene only under --free-lp
+    "kfAP":   {"min": 1e-3, "max": 10.0},   # kf  [1e-3, 10]
+    "DF":     {"min": 1e2,  "max": 1e4},
+    "L":      {"min": 1e-2, "max": 1e2},
+    "K":      {"min": 1e-3, "max": 1e2},
+    "P":      {"min": 1e-3, "max": 1e1},
+    "A":      {"min": 1e-2, "max": 1e2},
 }
 
-params_to_optimize = ["kfLA", "kfLK", "krLK", "kcatLK", "kfLP", "krLP", "kfAP", "DF", "L", "K", "P", "A"]
+# (FREE_LK, FREE_LP) -> short name used in output filenames and the CSV's Constraints column
+MODE_LABELS = {(False, False): "all",   (True, False): "no-LK",
+               (False, True):  "no-LP", (True, True):  "none"}
 
-# Only these two genes can violate kcatLK = 15*kfLK - krLK > 0, so only mutations
+# Set by configure_constraints(). These are module globals rather than Solver state
+# because `evaluate_candidate` runs inside forked pool workers and has to reach them
+# without being handed a bound method. configure_constraints() must therefore be called
+# BEFORE Solver.__init__ creates the pool -- the fork is what carries the configuration
+# into the workers.
+FREE_LK = FREE_LP = False
+MODE_LABEL = MODE_LABELS[(FREE_LK, FREE_LP)]
+params_to_optimize = []
+parameter_ranges = {}
+# Only these two genes can violate kcatLK = KMLK*kfLK - krLK > 0, so only mutations
 # touching them need a constraint re-check.
-IDX_KFLK, IDX_KRLK = params_to_optimize.index("kfLK"), params_to_optimize.index("krLK")
+IDX_KFLK = IDX_KRLK = None
+
+
+def configure_constraints(free_lk=False, free_lp=False):
+    """
+    Select which structural constraints are enforced, and derive the gene list from that.
+
+    free_lk : sample kcatLK directly instead of deriving it from kfLK/krLK, dropping the
+              positivity rejection along with it.
+    free_lp : sample krLP directly instead of deriving it from kfLP, and restore kfLP's
+              unconstrained lower bound of 1e-3.
+
+    Returns the resulting gene list; the module globals it sets are what the pool workers
+    actually read.
+    """
+    global FREE_LK, FREE_LP, MODE_LABEL, params_to_optimize, parameter_ranges
+    global IDX_KFLK, IDX_KRLK
+
+    FREE_LK, FREE_LP = bool(free_lk), bool(free_lp)
+    MODE_LABEL = MODE_LABELS[(FREE_LK, FREE_LP)]
+
+    params_to_optimize = (["kfLA", "kfLK", "krLK"]
+                          + (["kcatLK"] if FREE_LK else [])
+                          + ["kfLP"]
+                          + (["krLP"] if FREE_LP else [])
+                          + ["kfAP", "DF", "L", "K", "P", "A"])
+
+    # Copy the range dicts -- the kfLP bound below is mutated per-mode, and aliasing it
+    # back into PARAM_RANGES_ALL would leak the constrained bound into later calls.
+    parameter_ranges = {p: dict(PARAM_RANGES_ALL[p]) for p in params_to_optimize}
+    if not FREE_LP:
+        parameter_ranges["kfLP"]["min"] = KFLP_MIN_CONSTRAINED
+
+    IDX_KFLK = params_to_optimize.index("kfLK")
+    IDX_KRLK = params_to_optimize.index("krLK")
+
+    if not FREE_LK:
+        # generateCandidate narrows krLK's upper bound to KMLK*kfLK - KCATLK_MIN, which
+        # only works if kfLK has already been drawn and if that bound stays above krLK's
+        # floor even at the smallest kfLK. Both hold for the ranges above; asserting them
+        # means a later edit to those ranges fails here rather than silently sampling a
+        # reversed interval.
+        assert IDX_KFLK < IDX_KRLK, "generateCandidate must draw kfLK before krLK"
+        krlk_hi_at_kflk_min = KMLK * parameter_ranges["kfLK"]["min"] - KCATLK_MIN
+        assert krlk_hi_at_kflk_min > parameter_ranges["krLK"]["min"], (
+            f"LK constraint leaves no feasible krLK at kfLK="
+            f"{parameter_ranges['kfLK']['min']:g}")
+
+    return params_to_optimize
+
+
+# Default to the fully constrained configuration, so importing this module -- or forgetting
+# the call in a new entry point -- gives a well-defined GA rather than empty globals.
+configure_constraints(free_lk=False, free_lp=False)
 
 # ODE settings the GA passes to solve_ode.process_single_row. The integrator, tolerances
 # and output grid are solve_ode.py's business, not this file's.
@@ -93,17 +182,46 @@ SIM_TIME       = 2000.0
 SOLVER_TIMEOUT = 15.0
 
 
-def _build_ode_params(kfLA, kfLK, krLK, kcatLK, kfLP, krLP, kfAP, DF):
-    """Assemble the 13-element ODE parameter vector from the free rate/DF params."""
-    krLA   = KDLA * kfLA
-    #kcatLK = KMLK * kfLK - krLK
-    krAP   = KDAP * kfAP
-    return np.array([kfLA, krLA, kfLK, krLK, kcatLK,
-                     kfLP, krLP, KCAT_LP_FIXED,
+def _genes(candidate):
+    """Name a candidate's genes. The vector's length depends on the active mode."""
+    return dict(zip(params_to_optimize, candidate))
+
+
+def _derived(g):
+    """
+    kcatLK and krLP, whether they were sampled or follow from an enforced constraint.
+
+    Single source of truth for `evaluate_candidate` and `_build_row` alike, so the values
+    handed to the integrator and the values written to the CSV cannot drift.
+    """
+    kcatLK = g["kcatLK"] if FREE_LK else KMLK * g["kfLK"] - g["krLK"]
+    krLP   = g["krLP"]   if FREE_LP else KMLP * g["kfLP"] - KCAT_LP_FIXED
+    return kcatLK, krLP
+
+
+def _build_ode_params(g, kcatLK, krLP):
+    """Assemble the 13-element ODE parameter vector from the named free params."""
+    return np.array([g["kfLA"], KDLA * g["kfLA"], g["kfLK"], g["krLK"], kcatLK,
+                     g["kfLP"], krLP, KCAT_LP_FIXED,
                      KFAK_FIXED, KRAK_FIXED,
-                     kfAP, krAP, DF], dtype=np.float64)
+                     g["kfAP"], KDAP * g["kfAP"], g["DF"]], dtype=np.float64)
 
 
+def satisfies_constraints(candidate):
+    """
+    Whether a candidate is inside the feasible set while the LK constraint is on.
+
+    The bound is KCATLK_MIN rather than a bare > 0 so that this agrees exactly with what
+    generateCandidate constructs -- otherwise mutation and crossover could walk the
+    population into a sliver of kcatLK that the initial sampling never produces.
+
+    There is deliberately no LP counterpart: with the LP constraint enforced krLP is not a
+    gene, and kfLP's raised lower bound already guarantees krLP >= 1e-3, so no candidate
+    can violate it and no test would ever fire.
+    """
+    if FREE_LK:
+        return True
+    return KMLK * candidate[IDX_KFLK] - candidate[IDX_KRLK] >= KCATLK_MIN
 
 
 
@@ -131,11 +249,22 @@ def evaluate_candidate(candidate):
     comparison because that is what the timeout event inside `process_single_row`
     measures. The threshold is deliberately loose -- this is a diagnostic counter, not a
     control input.
-    """
-    kfLA, kfLK, krLK, kcatLK, kfLP, krLP, kfAP, DF, L, K, P, A = candidate
 
-    params = _build_ode_params(kfLA, kfLK, krLK, kcatLK, kfLP, krLP, kfAP, DF)
-    params = np.concatenate([params, np.array([L, K, P, A], dtype=np.float64)])
+    Candidates violating an enforced constraint are penalised with fitness 0.
+    """
+    g = _genes(candidate)
+    kcatLK, krLP = _derived(g)
+
+    # Safety net. Sampling builds the constraints in and mutation/crossover revert any
+    # violation, so
+    # this should never fire -- but a negative rate reaching the integrator would produce
+    # a plausible-looking trace rather than an error, which is worth one comparison.
+    if kcatLK <= 0 or krLP <= 0:
+        return (0.0, 0.0, 0.0, False, 0.0, False)
+
+    params = _build_ode_params(g, kcatLK, krLP)
+    params = np.concatenate(
+        [params, np.array([g["L"], g["K"], g["P"], g["A"]], dtype=np.float64)])
 
     t0 = time.perf_counter()
     metrics = process_single_row(params, T=SIM_TIME, timeout=SOLVER_TIMEOUT, method='LSODA')
@@ -149,7 +278,7 @@ def evaluate_candidate(candidate):
 
 class Solver:
     def __init__(self, populationSize=10000, NGEN=100, outfileName="ga_oscillator_results.csv",
-                 sampling="lhs", restarts=4, genBudget=100, patience=10, seed=None,
+                 restarts=4, genBudget=100, patience=10, seed=None,
                  hofSize=50):
         self.populationSize = populationSize
         self.NGEN           = NGEN        # max generations within a single restart
@@ -161,7 +290,6 @@ class Solver:
         self.indpb          = 0.2   # per-gene MUTATION probability
         self.eta            = 2.0   # polynomial mutation distribution index
         self.mutScale       = 0.25  # shrinks the polynomial step for finer local search
-        self.sampling       = sampling.lower()  # "lhs" or "random"
         self.seed           = seed
 
         # Two RNGs are in play -- `random` drives DEAP's operators (varAnd, tournament
@@ -179,12 +307,7 @@ class Solver:
 
         self.toolbox = base.Toolbox()
         self.toolbox.register("candidate",  self.generateCandidate)
-        if self.sampling == "lhs":
-            self.toolbox.register("population", self.generate_lhs_population)
-        elif self.sampling == "random":
-            self.toolbox.register("population", self.generate_random_population)
-        else:
-            raise ValueError(f"Unknown sampling method '{self.sampling}'; expected 'lhs' or 'random'.")
+        self.toolbox.register("population", self.generate_random_population)
         self.toolbox.register("mutate",     self.mutateCandidate,
                               indpb=self.indpb, eta=self.eta, scale=self.mutScale)
         self.toolbox.register("select",     tools.selTournament, tournsize=3)
@@ -207,33 +330,51 @@ class Solver:
         self._stream = None
         self._writer = None
 
-        self.pool = multiprocessing.Pool(processes=multiprocessing.cpu_count())
+        # sched_getaffinity, not cpu_count: cpu_count reports every CPU on the node and
+        # ignores the cgroup SLURM puts the job in, so a run given --cpus-per-task=8 on a
+        # shared node would fork 48 workers onto 8 cores. Four constraint modes are now
+        # run as four jobs rather than one, so co-scheduling is likelier than it was.
+        self.pool = multiprocessing.Pool(processes=len(os.sched_getaffinity(0)))
         # Small chunks: solve times vary by orders of magnitude, so the default
         # chunksize (~5200 at a 1M population) load-balances badly.
         self.toolbox.register("map", self.pool.map, chunksize=100)
 
-
-
     def generate_random_population(self, n):
-        """Generates the initial population by independent random log-uniform sampling,
-        respecting structural constraints."""
+        """Generates the initial population by independent log-uniform sampling, with
+        the active structural constraints built into the draw."""
         print("Generating initial population via random sampling...")
         population = [self.generateCandidate() for _ in range(n)]
         print(f"Successfully generated {n} random individuals.")
         return population
 
     def generateCandidate(self):
-        """Sample each free parameter uniformly in log10 space."""
-        while True:
-            candidate = []
-            for param_name in params_to_optimize:
-                low  = parameter_ranges[param_name]["min"]
-                high = parameter_ranges[param_name]["max"]
-                logval = np.random.uniform(math.log10(low), math.log10(high))
-                candidate.append(10.0 ** logval)
+        """
+        Draw one candidate log-uniformly per gene, constructed to satisfy the active
+        constraints rather than tested against them afterwards.
 
-            
-            return creator.Candidate(candidate)
+        Under the LK constraint krLK's upper bound is narrowed to KMLK*kfLK - KCATLK_MIN
+        once kfLK has been drawn, so kcatLK >= KCATLK_MIN holds by construction and no
+        draw is ever wasted. The LP constraint needs nothing here: krLP is not a gene and
+        kfLP's raised lower bound already guarantees krLP >= 1e-3.
+
+        This replaces a rejection loop that discarded 48% of its draws. Note that the two
+        are not the same distribution, and the difference is in this one's favour: keeping
+        only the feasible members of a joint log-uniform draw tilted the kfLK marginal
+        towards large values, because a large kfLK leaves far more feasible krLK than a
+        small one (86% of krLK's range at kfLK=10, against 20% at kfLK=1e-3). Drawing krLK
+        from its conditional range instead leaves kfLK log-uniform over its full range.
+        """
+        candidate = []
+        for param_name in params_to_optimize:
+            low  = parameter_ranges[param_name]["min"]
+            high = parameter_ranges[param_name]["max"]
+            if param_name == "krLK" and not FREE_LK:
+                # kfLK is already in `candidate` -- configure_constraints asserts the
+                # ordering, and that this bound stays above `low` for every legal kfLK.
+                high = min(high, KMLK * candidate[IDX_KFLK] - KCATLK_MIN)
+            candidate.append(10.0 ** np.random.uniform(math.log10(low), math.log10(high)))
+
+        return creator.Candidate(candidate)
 
     def mutateCandidate(self, candidate, indpb, eta, scale):
         """
@@ -247,8 +388,8 @@ class Solver:
         artifact. `scale` shrinks the step further so late generations can refine
         rather than jump up to a full decade per gene.
 
-        If a mutation breaks the kcatLK constraint, only that gene is reverted; the
-        rest of the individual is preserved.
+        If a mutation breaks the LK constraint (when it is enforced), only that gene is
+        reverted; the rest of the individual is preserved.
         """
         for idx in range(len(candidate)):
             if np.random.rand() >= indpb:
@@ -280,6 +421,10 @@ class Solver:
             # this should never actually bind.
             candidate[idx] = 10.0 ** min(max(x, xl), xu)
 
+            # Only kfLK/krLK can break the constraint, so re-checking the other genes is
+            # wasted work -- and under --free-lk satisfies_constraints is a no-op anyway.
+            if idx in (IDX_KFLK, IDX_KRLK) and not satisfies_constraints(candidate):
+                candidate[idx] = old_val
 
         return (candidate,)
 
@@ -291,7 +436,12 @@ class Solver:
         # 2. Perform the crossover
         tools.cxTwoPoint(ind1, ind2)
 
-        
+        # 3. Check constraints. If a child is invalid, revert it to its parent's state.
+        if not satisfies_constraints(ind1):
+            ind1[:] = parent1_backup
+
+        if not satisfies_constraints(ind2):
+            ind2[:] = parent2_backup
 
         return ind1, ind2
 
@@ -483,8 +633,15 @@ class Solver:
 
     @staticmethod
     def _build_row(opt, fitness_val, period_val, amplitude_val, is_osc):
-        """Expand a free-parameter vector into the full ODE parameter set for output."""
-        kfLA, kfLK, krLK, kcatLK, kfLP, krLP, kfAP, DF, L, K, P, A = opt
+        """
+        Expand a free-parameter vector into the full ODE parameter set for output.
+
+        The column set is identical in all four constraint modes -- a quantity that is not
+        a gene in the active mode is filled in from its constraint -- so CSVs from
+        different modes can be compared, or concatenated, with no reshaping.
+        """
+        g = _genes(opt)
+        kcatLK, krLP = _derived(g)
         return {
             'Fitness':        fitness_val,
             'Period':         period_val,
@@ -494,25 +651,28 @@ class Solver:
             # period/amplitude gate does not apply. Recorded rather than enforced, so
             # filtering on it stays a post-processing choice.
             'Is_Oscillatory': bool(is_osc),
-            # Free parameters
-            'kfLA':   kfLA,
-            'kfLK':   kfLK,
-            'krLK':   krLK,
-            'kfLP':   kfLP,
+            # Which constraints the run that produced this row enforced.
+            'Constraints':    MODE_LABEL,
+            # Model parameters. Whether a given one was sampled or derived depends on the
+            # mode; the Constraints column above is what records that.
+            'kfLA':   g['kfLA'],
+            'kfLK':   g['kfLK'],
+            'krLK':   g['krLK'],
+            'kfLP':   g['kfLP'],
             'krLP':   krLP,
-            'kfAP':   kfAP,
-            'DF':     DF,
-            'L':      L,
-            'K':      K,
-            'P':      P,
-            'A':      A,
+            'kfAP':   g['kfAP'],
+            'DF':     g['DF'],
+            'L':      g['L'],
+            'K':      g['K'],
+            'P':      g['P'],
+            'A':      g['A'],
             # Derived / fixed (full ODE parameter set)
-            'krLA':   KDLA * kfLA,
+            'krLA':   KDLA * g['kfLA'],
             'kcatLK': kcatLK,
             'kcatLP': KCAT_LP_FIXED,
             'kfAK':   KFAK_FIXED,
             'krAK':   KRAK_FIXED,
-            'krAP':   KDAP * kfAP,
+            'krAP':   KDAP * g['kfAP'],
         }
 
     def write_sortedParms(self, viablePoints, viableFitness):
@@ -565,8 +725,51 @@ class Solver:
 
 # ==================== MAIN ====================
 
+def _parse_args():
+    parser = argparse.ArgumentParser(
+        description="Genetic algorithm for the oscillator model. The LK and LP structural "
+                    "constraints can each be switched off, giving four modes; both are "
+                    "enforced unless a flag says otherwise.")
+    parser.add_argument("--free-lk", action="store_true",
+                        help="Drop the LK constraint: sample kcatLK as a free gene instead "
+                             f"of deriving it as {KMLK:g}*kfLK - krLK > 0.")
+    parser.add_argument("--free-lp", action="store_true",
+                        help="Drop the LP constraint: sample krLP as a free gene instead of "
+                             f"deriving it as {KMLP:g}*kfLP - {KCAT_LP_FIXED:g}, and restore "
+                             "kfLP's unconstrained lower bound of 1e-3.")
+    # Sizing. Job 29959062 reached only generation 68 of 100 in its full 3-day allocation
+    # at ~2.3 s/solve. Read the actual cost off the per-generation `s/solve` line in the
+    # log and re-size from it rather than trusting any default here:
+    #     generations * population * 0.76 * mean_solve_s / n_cores <= wall_seconds
+    # (the 0.76 is varAnd's clone-skip rate -- 24% of offspring arrive unmodified with a
+    # still-valid fitness and are not re-solved).
+    parser.add_argument("--pop", type=int, default=100_000,
+                        help="Population size (default: %(default)s).")
+    parser.add_argument("--gens", type=int, default=100,
+                        help="Max generations within a single restart (default: %(default)s).")
+    parser.add_argument("--gen-budget", type=int, default=100,
+                        help="Total generations across all restarts -- the compute cap "
+                             "(default: %(default)s).")
+    parser.add_argument("--restarts", type=int, default=4,
+                        help="Max independent restarts within that budget (default: %(default)s).")
+    parser.add_argument("--patience", type=int, default=10,
+                        help="Abandon a basin after this many barren generations "
+                             "(default: %(default)s).")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="RNG seed. Pass the same value to every constraint mode when "
+                             "the runs are meant to be compared.")
+    parser.add_argument("--outdir", default=os.path.dirname(os.path.abspath(__file__)),
+                        help="Directory for the result CSVs (default: this script's directory).")
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
     start_time = time.time()
+    args = _parse_args()
+
+    # Before Solver.__init__, which creates the worker pool: the fork is what carries this
+    # configuration into the workers that run evaluate_candidate.
+    configure_constraints(free_lk=args.free_lk, free_lp=args.free_lp)
 
     # Pre-compile Numba functions in the main process before forking workers.
     # On Linux (fork), child processes inherit the compiled code, avoiding
@@ -580,37 +783,28 @@ if __name__ == "__main__":
     _ = full_model_ode(0.0, _dummy_y, _dummy_params)
     print("Pre-compilation complete.")
 
-    # Sizing. Job 29959062 reached only generation 68 of 100 in its full 3-day allocation
-    # at ~2.3 s/solve. Read the actual cost off the per-generation `s/solve` line in the
-    # log and re-size from it rather than trusting any estimate here:
-    #     generations * population * 0.76 * mean_solve_s / n_cores <= wall_seconds
-    # (the 0.76 is varAnd's clone-skip rate -- 24% of offspring arrive unmodified with a
-    # still-valid fitness and are not re-solved).
-    POP_SIZE   = 100_000
-    N_GEN      = 100      # max generations within a single restart
-    GEN_BUDGET = 100      # total generations across all restarts (the compute cap)
-    RESTARTS   = 4        # max independent restarts within that budget
-    PATIENCE   = 10       # abandon a basin after this many barren generations
-    SAMPLING   = "random" # initial population sampling: "lhs" or "random"
-    SEED       = None     # set an int for a reproducible run
-
+    os.makedirs(args.outdir, exist_ok=True)
     random_id = np.random.randint(1, 10000)
-    outfile   = f"ga_oscillator_results_{random_id}.csv"
-    print(f"Population size : {POP_SIZE}")
-    print(f"Generations     : {N_GEN} max per restart, {GEN_BUDGET} total budget")
-    print(f"Restarts        : up to {RESTARTS}, patience {PATIENCE} barren generations")
-    print(f"Sampling method : {SAMPLING}")
-    print(f"Seed            : {SEED}")
+    outfile   = os.path.join(args.outdir, f"ga_{MODE_LABEL}_{random_id}.csv")
+    print(f"Constraints     : {MODE_LABEL}  "
+          f"(LK {'FREE' if FREE_LK else 'enforced'}, LP {'FREE' if FREE_LP else 'enforced'})")
+    print(f"Population size : {args.pop}")
+    print(f"Generations     : {args.gens} max per restart, {args.gen_budget} total budget")
+    print(f"Restarts        : up to {args.restarts}, patience {args.patience} barren generations")
+    print(f"Seed            : {args.seed}")
     print(f"Output file     : {outfile}")
-    print(f"CPU cores       : {multiprocessing.cpu_count()}")
+    print(f"CPU cores       : {len(os.sched_getaffinity(0))} allocated "
+          f"(node has {multiprocessing.cpu_count()})")
     print(f"Free parameters : {params_to_optimize}")
+    print(f"kfLP range      : [{parameter_ranges['kfLP']['min']:g}, "
+          f"{parameter_ranges['kfLP']['max']:g}]")
     print(f"ODE settings    : T={SIM_TIME:g}, timeout={SOLVER_TIMEOUT:g} s "
           f"(integrator and tolerances are solve_ode.process_single_row's)")
     print(flush=True)
 
-    solver = Solver(populationSize=POP_SIZE, NGEN=N_GEN, outfileName=outfile,
-                    sampling=SAMPLING, restarts=RESTARTS, genBudget=GEN_BUDGET,
-                    patience=PATIENCE, seed=SEED)
+    solver = Solver(populationSize=args.pop, NGEN=args.gens, outfileName=outfile,
+                    restarts=args.restarts,
+                    genBudget=args.gen_budget, patience=args.patience, seed=args.seed)
     viablePoints, viableFitness = solver.run()
 
     if viableFitness:
